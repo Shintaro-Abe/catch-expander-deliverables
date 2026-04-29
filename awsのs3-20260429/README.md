@@ -84,4 +84,4 @@ terraform apply -var="enable_object_lock=true" -var="object_lock_mode=GOVERNANCE
 
 ---
 
-📝 [Notionで詳細を見る]()
+📝 [Notionで詳細を見る](https://app.notion.com/p/AWS-S3-35147b55202e81058399eb8673a16792)
