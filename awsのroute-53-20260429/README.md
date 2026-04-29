@@ -111,4 +111,4 @@ dig A example.com +dnssec @8.8.8.8
 
 ---
 
-📝 [Notionで詳細を見る]()
+📝 [Notionで詳細を見る](https://app.notion.com/p/AWS-Route-53-35147b55202e810badffdd4768ba9b4c)
