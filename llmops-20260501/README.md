@@ -452,4 +452,4 @@ embedding = json.loads(embed_response["body"].read())["embedding"]
 
 ---
 
-📝 [Notionで詳細を見る]()
+📝 [Notionで詳細を見る](https://app.notion.com/p/LLMOps-35347b55202e81a4a531eaa939c5e789)
