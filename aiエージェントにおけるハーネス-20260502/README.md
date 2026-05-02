@@ -1,220 +1,164 @@
 ## プログラムコード（Python またはユーザープロファイルの技術スタック）
 
-# AIエージェントハーネス実装サンプル（PoC）
+# AIエージェントハーネス - Pythonスケルトン実装
 
-> **PoC品質**: このコードは概念実証（Proof of Concept）用です。本番環境での利用前に十分なテストと改修を行ってください。
+> **PoC品質**: 本番利用前にセキュリティレビュー・認証基盤・永続化バックエンドの接続を行うこと。
 
 ---
 
 ## 概要
 
-AIエージェントの「**ハーネス（Harness）**」を Python で実装したサンプルコードです。
+**「Agent = Model + Harness」** という設計思想に基づいた、AIエージェントハーネスのPythonスケルトン実装です。
 
-### ハーネスとは？
+LLM（大規模言語モデル）本体は推論・生成に専念し、それ以外の **ツール管理・メモリ・コンテキスト・ライフサイクルフック・信頼性制御・可観測性** をハーネスが担います。
 
-| 比喩 | 説明 |
-|------|------|
-| LLM（モデル）= 優秀な専門家 | 知識と推論力はあるが、道具も記憶もシステムアクセスも持たない |
-| ハーネス = オフィス環境 | 電話・PC・書類棚・スケジュール管理など、専門家を支える全インフラ |
-
-> エンタープライズAI障害の **65% はハーネス欠陥**（コンテキストドリフト・スキーマ不整合・状態劣化）に起因します。
+```
+┌─────────────────────────────────────────────────────┐
+│                   AgentHarness                      │
+│  ┌──────────┐  ┌──────────┐  ┌──────────────────┐  │
+│  │  Tools   │  │  Memory  │  │  Observability   │  │
+│  │ Registry │  │ Manager  │  │   Collector      │  │
+│  └──────────┘  └──────────┘  └──────────────────┘  │
+│  ┌──────────────────────────────────────────────┐   │
+│  │        Circuit Breaker + Retry Logic        │   │
+│  └──────────────────────────────────────────────┘  │
+│  ┌──────────────────────────────────────────────┐   │
+│  │          Lifecycle Hook System              │   │
+│  └──────────────────────────────────────────────┘  │
+└─────────────────┬───────────────────────────────────┘
+                  │ API呼び出し
+         ┌────────▼────────┐
+         │   Anthropic     │
+         │   Claude API    │
+         └─────────────────┘
+```
 
 ---
 
 ## ファイル構成
 
-```
-.
-├── agent_harness.py    # メインハーネス（ReAct ループ・状態管理・統合制御）
-├── tool_registry.py    # ツールレジストリ（登録・発見・スキーマ生成・実行）
-├── memory_manager.py   # メモリ管理（短期・長期・エピソード記憶）
-├── error_handler.py    # エラーハンドリング（リトライ・フォールバック・サーキットブレーカー）
-└── README.md           # このファイル
-```
+| ファイル | 役割 |
+|--------|------|
+| `agent_harness.py` | ハーネス本体。エージェントループ・フック・リトライ・コンテキスト管理 |
+| `tools.py` | ツールレジストリと組み込みツール（ReadFile・WriteFile・Bash等）|
+| `memory.py` | 3層メモリ管理（短期・ワーキング・長期記憶）|
+| `observability.py` | 分散トレース・構造化ログ・メトリクス・評価シグナル |
 
 ---
 
-## アーキテクチャ図
+## セットアップ
 
+```bash
+# 依存パッケージのインストール
+pip install anthropic
+
+# Anthropic APIキーを環境変数に設定（シークレットをコードに書かないこと）
+export ANTHROPIC_API_KEY="sk-ant-..."
 ```
-ユーザー入力
-     │
-     ▼
-┌────────────────────────────────────────────────────┐
-│               AgentHarness（agent_harness.py）      │
-│                                                     │
-│  ┌─────────────────────────────────────────────┐   │
-│  │              ReAct ループ                    │   │
-│  │                                             │   │
-│  │  [1] LLM呼び出し ──→ stop_reason?           │   │
-│  │                         │                  │   │
-│  │            end_turn ────┘         tool_use │   │
-│  │               │                       │   │   │
-│  │          最終応答返却            [2] ツール実行│   │
-│  │                                       │   │   │
-│  │                    ツール結果をメモリに追加   │   │
-│  │                           │               │   │
-│  │                    [1]に戻る ──────────────┘   │
-│  └─────────────────────────────────────────────┘   │
-│          ↑              ↑              ↑            │
-│  ToolRegistry    MemoryManager   AgentErrorHandler  │
-│  (tool_registry) (memory_manager) (error_handler)   │
-└────────────────────────────────────────────────────┘
-```
-
----
-
-## モジュール詳細
-
-### 1. `tool_registry.py` — ツールレジストリ
-
-**役割**: エージェントが利用可能なツールを一元管理する「内線電話帳」
-
-| 機能 | メソッド | 説明 |
-|------|----------|------|
-| 登録 | `@registry.register(...)` | デコレータで関数をツールとして登録 |
-| 発見 | `registry.discover(keyword, tags)` | キーワード・タグで検索 |
-| スキーマ生成 | `registry.get_schema(allowed_tools)` | LLM向けJSON スキーマを生成 |
-| 実行 | `registry.call(name, **kwargs)` | ツールを名前で呼び出し |
-| ヘルスチェック | `registry.health_check()` | 全ツールの稼働確認 |
-
-**Just-in-Time インジェクション**: `allowed_tools` で必要なツールのみをプロンプトに注入し、LLMのアテンション効率を向上させます。
-
-```python
-# ツール定義の例
-@registry.register(name="calculator", description="四則演算を実行", tags=["math"])
-def calculator(expression: str) -> str:
-    ...
-```
-
----
-
-### 2. `memory_manager.py` — メモリ管理
-
-**役割**: エージェントの記憶を階層的に管理する
-
-| 記憶の種類 | クラス | 比喩 |
-|-----------|--------|------|
-| ワーキングメモリ | `WorkingMemory` | 作業台（今やっている仕事の書類） |
-| エピソード記憶 | `EpisodicMemory` | 日記（過去の経験の記録） |
-| セマンティック記憶 | `SemanticMemory` | ファイリングキャビネット（整理された知識） |
-
-**コンテキスト圧縮**: コンテキストウィンドウの上限に達すると古いメッセージを自動的にサマリーに変換します（要約ドリフト対策として原文はエピソード記憶に保存）。
-
-```python
-manager = MemoryManager()
-manager.add_user_message("AWSとは？")
-manager.add_assistant_message("AWSはAmazonのクラウドサービスです。")
-manager.remember("user_goal", "クラウドを学習する", tags=["goal"])
-
-# RAG的アプローチでのキーワード検索（全記憶層横断）
-results = manager.recall_by_keyword("AWS")
-```
-
----
-
-### 3. `error_handler.py` — エラーハンドリング
-
-**役割**: 3層のエラー保護メカニズムを提供
-
-```
-リクエスト
-  └─ [1] リトライ（指数バックオフ + ジッター）    ← 一時エラー（429, 500等）
-       └─ [2] フォールバック（代替プロバイダー）   ← リトライ枯渇時
-            └─ [3] サーキットブレーカー            ← 持続的障害
-                 └─ [4] エスカレーション / 最終応答
-```
-
-| 機能 | クラス/関数 | 役割 |
-|------|------------|------|
-| リトライ | `with_retry()` | 指数バックオフ + ジッターで再試行 |
-| フォールバック | `with_fallback()` | プロバイダーチェーン（Claude Opus → Sonnet → Haiku） |
-| サーキットブレーカー | `CircuitBreaker` | 持続的障害時にリクエストをブロック |
-| エラー分類 | `classify_error()` | HTTP ステータスからリトライ可否を判定 |
-
-```python
-handler = AgentErrorHandler()
-result = handler.execute_with_protection(
-    primary_func=lambda: call_claude_opus(prompt),
-    fallback_funcs=[
-        ("claude-sonnet", lambda: call_claude_sonnet(prompt)),
-        ("claude-haiku",  lambda: call_claude_haiku(prompt)),
-    ],
-)
-```
-
----
-
-### 4. `agent_harness.py` — メインハーネス
-
-**役割**: 上記3モジュールを統合してエージェントループを制御する
-
-**主要コンポーネント**:
-
-| コンポーネント | クラス | 役割 |
-|--------------|--------|------|
-| 状態管理 | `AgentState` | IDLE→PLANNING→EXECUTING→VERIFYING→COMPLETED |
-| バジェット管理 | `BudgetConfig` | ターン数・ツール呼び出し数・タイムアウトの上限設定 |
-| ループ検出 | `LoopDetector` | SHA256ハッシュで同一状態の繰り返しを検知 |
-| 設定 | `HarnessConfig` | モデルID・システムプロンプト・各種設定を一元管理 |
 
 ---
 
 ## クイックスタート
 
-### 動作確認（boto3 不要）
+```python
+from agent_harness import AgentHarness, AgentConfig, HookEvent, example_block_hook
+from tools import ToolRegistry, ReadFileTool, BashTool
 
-```bash
-# Python 3.10+ 推奨
-python tool_registry.py    # ツールレジストリの動作確認
-python memory_manager.py   # メモリ管理の動作確認
-python error_handler.py    # エラーハンドリングの動作確認
-python agent_harness.py    # ハーネス全体の動作確認（スタブLLM使用）
+# 1. ツールレジストリのセットアップ
+registry = ToolRegistry()
+registry.register(ReadFileTool())
+registry.register(BashTool(timeout=30, allowed_commands=["ls", "cat", "grep"]))
+
+# 2. ハーネスの設定と初期化
+config = AgentConfig(
+    model="claude-opus-4-7",
+    max_turns=10,
+    enable_prompt_cache=True,  # プロンプトキャッシュでコスト削減
+)
+harness = AgentHarness(config=config, tools=registry)
+
+# 3. フックの登録（危険コマンドのブロック）
+harness.add_hook(HookEvent.PRE_TOOL_USE, example_block_hook)
+
+# 4. エージェント実行
+result = harness.run("現在のディレクトリのPythonファイル一覧を表示してください。")
+print(result)
 ```
 
-### AWS Bedrock との接続
+---
+
+## 主要コンポーネント
+
+### ライフサイクルフック
+
+エージェントの判断レイヤーの外側で、モデルの自己規制に依存せず外部から制約を強制する仕組みです。
 
 ```python
-# agent_harness.py の先頭で以下を変更
-BEDROCK_CLIENT_AVAILABLE = True  # False → True
+def my_audit_hook(ctx: HookContext) -> None:
+    if ctx.event == HookEvent.PRE_TOOL_USE:
+        print(f"ツール呼び出し: {ctx.tool_name} | 入力: {ctx.tool_input}")
+        # ctx.block = True にするとツール実行を拒否できる
 
-# 必要なライブラリのインストール
-# pip install boto3
+harness.add_hook(HookEvent.PRE_TOOL_USE, my_audit_hook)
+```
 
-# AWS 認証設定（環境変数または IAM ロール）
-# export AWS_DEFAULT_REGION=us-west-2
-# export AWS_ACCESS_KEY_ID=...      ← 本番では Secrets Manager を使用
-# export AWS_SECRET_ACCESS_KEY=...  ← 本番では Secrets Manager を使用
+**利用可能なフックイベント:**
+
+| イベント | 発火タイミング | 主な用途 |
+|---------|--------------|---------|
+| `SESSION_START` | セッション開始時 | 初期化・認証チェック |
+| `PRE_TOOL_USE` | ツール実行直前 | 監査ログ・危険操作のブロック |
+| `POST_TOOL_USE` | ツール実行直後 | 結果の検証・変換 |
+| `PRE_COMPACT` | コンテキスト圧縮前 | 重要情報の退避 |
+| `POST_COMPACT` | コンテキスト圧縮後 | 圧縮後の整合性確認 |
+| `STOP` | 停止試行時 | 未完了タスクの検出 |
+
+### サーキットブレーカー
+
+LLM APIの障害からシステム全体を保護する3状態ステートマシン。
+
+```
+正常時       障害検知時        回復確認中
+[CLOSED] → [OPEN] → [HALF-OPEN] → [CLOSED]
+全通過     即時拒否    一部通過       全通過
+```
+
+### 3層メモリ構造
+
+```
+Layer 1: セッション内（コンテキストウィンドウ内）      ← 現在の会話
+Layer 2: ワーキングメモリ（セッション中永続）          ← 作業メモ
+Layer 3: 長期メモリ（セッション間永続 / 外部DB）       ← 学習・知識
 ```
 
 ---
 
 ## 本番化に向けたチェックリスト
 
-- [ ] `BEDROCK_CLIENT_AVAILABLE = True` に変更して boto3 を接続
-- [ ] `BudgetConfig` の上限値をユースケースに合わせて調整
-- [ ] `RetryConfig.max_attempts` を調整（推奨: 3〜5回）
-- [ ] メモリバックエンドをインメモリ → 永続ストア（DynamoDB / PostgreSQL）に変更
-- [ ] CloudWatch EMF でメトリクスを送信（トークン使用量・ツール呼び出し数・レイテンシ）
-- [ ] IAM ロールを最小権限に絞り込む（エージェント専用ロールを作成）
-- [ ] Amazon Bedrock Guardrails でプロンプトインジェクション対策を実装
-- [ ] シークレット（API キー等）は AWS Secrets Manager Agent で管理
+- [ ] `MemoryBackend` を DynamoDB / Redis / pgvector に差し替える
+- [ ] `ObservabilityCollector` を AWS X-Ray / CloudWatch Logs に接続する
+- [ ] `BashTool` の `allowed_commands` を最小限に絞る
+- [ ] `SearchKnowledgeTool` を Amazon Bedrock Knowledge Base に接続する
+- [ ] プロンプトインジェクション対策フックを `PRE_TOOL_USE` に追加する
+- [ ] APIキーを AWS Secrets Manager で管理する
+- [ ] `AgentConfig.model` を本番モデルIDに更新する
 
 ---
 
-## 関連 AWS サービス
+## 参考アーキテクチャ（AWS構成）
 
-| 目的 | 推奨サービス |
-|------|-------------|
-| LLM 呼び出し | Amazon Bedrock Converse API |
-| フルマネージドハーネス | Amazon Bedrock AgentCore（2026年プレビュー） |
-| 分散トレーシング | AWS Distro for OpenTelemetry (ADOT) |
-| ログ・メトリクス | CloudWatch Logs + Embedded Metric Format |
-| シークレット管理 | AWS Secrets Manager Agent |
-| 入出力検証 | Amazon Bedrock Guardrails |
-| インフラ定義 | AWS CDK (`aws-cdk-lib.aws_bedrock_alpha`) |
+長時間セッション（8時間超）が必要な場合は **Amazon Bedrock AgentCore** へのデプロイを推奨。
+短命なリクエスト処理には Lambda + API Gateway のサーバーレス構成が適切。
+
+```
+API Gateway → Lambda → AgentHarness → Anthropic API
+                  ↓
+            DynamoDB（メモリ永続化）
+                  ↓
+            CloudWatch Logs（可観測性）
+```
 
 
 ---
 
-📝 [Notionで詳細を見る](https://www.notion.so/AI-35447b55202e81428b44e1221c6955ba)
+📝 [Notionで詳細を見る]()
