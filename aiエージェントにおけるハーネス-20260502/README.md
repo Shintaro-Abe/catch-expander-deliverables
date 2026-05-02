@@ -217,4 +217,4 @@ BEDROCK_CLIENT_AVAILABLE = True  # False → True
 
 ---
 
-📝 [Notionで詳細を見る]()
+📝 [Notionで詳細を見る](https://www.notion.so/AI-35447b55202e81428b44e1221c6955ba)
