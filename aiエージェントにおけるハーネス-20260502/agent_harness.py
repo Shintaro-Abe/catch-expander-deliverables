@@ -1,667 +1,591 @@
-# PoC品質 - このコードは概念実証用です。本番環境での利用前に十分なテストと改修を行ってください。
+# PoC品質 - 本番利用前に認証・エラーハンドリング・セキュリティレビューを行うこと
 """
-AIエージェントハーネス（Agent Harness）メインモジュール
+AIエージェントハーネス - コアモジュール
 
-このモジュールは、AIエージェントのコアループ（ReAct パターン）と
-状態管理・ループ制御・観測性を統合したハーネス実装です。
-
-【ハーネスとは？】
-ハーネス = エージェントを動かすための「オフィス環境全体」
-
-  ┌─────────────────────────────────────────────────┐
-  │               AIエージェントハーネス             │
-  │  ┌──────────┐  ┌──────────┐  ┌─────────────┐  │
-  │  │ ツール    │  │ メモリ   │  │ エラー処理   │  │
-  │  │ レジストリ│  │ マネージャ│  │（リトライ等）│  │
-  │  └──────────┘  └──────────┘  └─────────────┘  │
-  │         ↑              ↑              ↑          │
-  │  ┌──────────────────────────────────────────┐   │
-  │  │         ReAct ループ制御                  │   │
-  │  │  思考(Thought) → 行動(Action) → 観察     │   │
-  │  │  (Observation) → 思考 → ... → 完了       │   │
-  │  └──────────────────────────────────────────┘   │
-  │         ↑                                        │
-  │  ┌──────────────────────────────────────────┐   │
-  │  │         LLM（Amazon Bedrock Converse API）│   │
-  │  └──────────────────────────────────────────┘   │
-  └─────────────────────────────────────────────────┘
-
-【ReAct パターンとは？】
-「Reasoning（推論）+ Acting（行動）」の略。
-1. LLMが「次にすべき行動」を思考（Thought）
-2. 特定のツールを呼び出す（Action）
-3. ツール実行結果を受け取る（Observation）
-4. Observation をコンテキストに追加し次のサイクルへ
-
-この繰り返しにより、エージェントは複雑なタスクを段階的に解決します。
-
-【AWS サービスとの関係】
-このファイル単体は boto3 が不要なスタンドアロン実装です。
-AWS Bedrock と接続する場合は BEDROCK_CLIENT_AVAILABLE フラグを True に変更し、
-_call_llm メソッド内で boto3 の converse() API を呼び出してください。
+概念: Agent = Model + Harness
+ハーネスはLLM（大規模言語モデル）本体を除く「すべて」を担う層。
+ツール管理・メモリ・コンテキスト・ライフサイクルフック・信頼性制御を一元管理する。
 """
 
 from __future__ import annotations
 
-import enum
-import hashlib
-import json
-import logging
 import time
+import uuid
+import logging
+from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
-from typing import Any, Dict, List, Optional
+from enum import Enum, auto
+from typing import Any, Callable, Optional
 
-from error_handler import AgentErrorHandler, RetryConfig, CircuitBreakerConfig
-from memory_manager import MemoryManager
-from tool_registry import ToolRegistry, registry as default_registry
+import anthropic  # pip install anthropic
+
+from memory import MemoryManager
+from observability import ObservabilityCollector, Span
+from tools import ToolRegistry
 
 logger = logging.getLogger(__name__)
 
-# boto3 が利用可能な環境では True に変更してください
-BEDROCK_CLIENT_AVAILABLE = False
 
+# ---------------------------------------------------------------------------
+# データ構造
+# ---------------------------------------------------------------------------
 
-# --------------------------------------------------------------------------- #
-# 状態管理（ステートマシン）
-# --------------------------------------------------------------------------- #
-
-class AgentState(enum.Enum):
-    """
-    エージェントのライフサイクル状態。
-
-    【初学者向け補足】
-    状態管理は「プロジェクトの進捗ボード」に相当します。
-    今どの段階にいるか・何が完了したか・次は何をすべきかを常に把握し、
-    途中で中断しても再開できるようにします。
-
-    IDLE      → 待機中（タスク未開始）
-    PLANNING  → タスクを計画中（LLM が方針を考えている）
-    EXECUTING → ツールを実行中
-    VERIFYING → 結果を検証中
-    COMPLETED → タスク完了
-    ERROR     → エラー発生
-    ABORTED   → 上限・制限に達して中断
-    """
-    IDLE = "idle"
-    PLANNING = "planning"
-    EXECUTING = "executing"
-    VERIFYING = "verifying"
-    COMPLETED = "completed"
-    ERROR = "error"
-    ABORTED = "aborted"
+class HookEvent(Enum):
+    """ライフサイクルフックの発火点"""
+    SESSION_START   = auto()   # セッション開始時
+    PRE_TOOL_USE    = auto()   # ツール実行前
+    POST_TOOL_USE   = auto()   # ツール実行後
+    PRE_COMPACT     = auto()   # コンテキスト圧縮前
+    POST_COMPACT    = auto()   # コンテキスト圧縮後
+    STOP            = auto()   # エージェント停止試行時
 
 
 @dataclass
-class AgentStateRecord:
-    """状態遷移の1レコード（監査ログ用）。"""
-    from_state: AgentState
-    to_state: AgentState
-    reason: str
-    timestamp: float = field(default_factory=time.time)
-    turn_number: int = 0
+class HookContext:
+    """フック呼び出し時に渡されるコンテキスト"""
+    event: HookEvent
+    session_id: str
+    tool_name: Optional[str] = None
+    tool_input: Optional[dict] = None
+    tool_result: Optional[Any] = None
+    # フック側から "block=True" をセットするとツール実行を拒否できる
+    block: bool = False
+    block_reason: str = ""
 
-
-# --------------------------------------------------------------------------- #
-# バジェット管理（暴走実行防止）
-# --------------------------------------------------------------------------- #
 
 @dataclass
-class BudgetConfig:
+class AgentConfig:
     """
-    エージェントの実行上限設定。
-
-    【重要】
-    LLM エージェントは適切な上限がないと無限ループに陥る可能性があります。
-    特に本番環境では必ずこれらの上限を設定してください。
-
-    Attributes:
-        max_turns          : 最大ターン数（1ターン = LLM呼び出し1回）
-        max_tool_calls     : 最大ツール呼び出し回数（全ターン合計）
-        max_tokens_total   : 最大トークン消費量（概算）
-        global_timeout_sec : エージェント全体のタイムアウト秒数
+    ハーネスの設定。シークレット類は環境変数から取得すること。
+    （ANTHROPIC_API_KEY 等は os.environ 経由で渡す）
     """
-    max_turns: int = 20
-    max_tool_calls: int = 50
-    max_tokens_total: int = 100_000
-    global_timeout_sec: float = 300.0  # 5分
+    model: str = "claude-opus-4-7"        # 使用するClaudeモデル
+    max_tokens: int = 4096                 # 1回の推論での最大出力トークン数
+    max_turns: int = 20                    # エージェントループの最大ターン数
+    context_window_limit: int = 160_000   # コンテキスト上限（トークン概算）
+    compact_threshold: float = 0.8        # この割合を超えたらコンパクション実行
+    retry_max: int = 3                    # LLM呼び出し失敗時の最大リトライ回数
+    retry_base_delay: float = 1.0         # 指数バックオフの基底秒数
+    enable_prompt_cache: bool = True      # プロンプトキャッシング有効化フラグ
 
 
-# --------------------------------------------------------------------------- #
-# ループ検出（同一状態の繰り返し防止）
-# --------------------------------------------------------------------------- #
+# ---------------------------------------------------------------------------
+# サーキットブレーカー（信頼性パターン）
+# ---------------------------------------------------------------------------
 
-class LoopDetector:
+class CircuitState(Enum):
+    CLOSED    = "closed"      # 正常（全リクエスト通過）
+    OPEN      = "open"        # 障害検知（リクエスト即時拒否）
+    HALF_OPEN = "half_open"   # 回復確認中（一部リクエストのみ通過）
+
+
+class CircuitBreaker:
     """
-    同一アクションの繰り返しを検出してエージェントの無限ループを防ぐ。
-
-    SHA256 ハッシュでコンテキストの状態をフィンガープリントし、
-    同一ハッシュが consecutive_threshold 回連続した場合にループと判定します。
-    """
-
-    def __init__(self, consecutive_threshold: int = 3) -> None:
-        self.threshold = consecutive_threshold
-        self._hash_counts: Dict[str, int] = {}
-        self._last_hash: Optional[str] = None
-
-    def check(self, context_hash: str) -> bool:
-        """
-        ループを検出した場合 True を返す。
-
-        Args:
-            context_hash: 現在のコンテキストのハッシュ
-        Returns:
-            True の場合はループ検出 → エージェントを停止すべき
-        """
-        if context_hash == self._last_hash:
-            self._hash_counts[context_hash] = self._hash_counts.get(context_hash, 1) + 1
-        else:
-            self._hash_counts[context_hash] = 1
-            self._last_hash = context_hash
-
-        return self._hash_counts[context_hash] >= self.threshold
-
-    def reset(self) -> None:
-        self._hash_counts.clear()
-        self._last_hash = None
-
-
-# --------------------------------------------------------------------------- #
-# ハーネスの設定
-# --------------------------------------------------------------------------- #
-
-@dataclass
-class HarnessConfig:
-    """
-    エージェントハーネスの全設定を保持するデータクラス。
-
-    この設定オブジェクトをカスタマイズすることで、
-    エージェントの動作を柔軟に制御できます。
-    """
-    model_id: str = "anthropic.claude-sonnet-4-5"
-    system_prompt: str = "あなたは有能なAIアシスタントです。ツールを活用してタスクを解決してください。"
-    budget: BudgetConfig = field(default_factory=BudgetConfig)
-    retry: RetryConfig = field(default_factory=lambda: RetryConfig(max_attempts=3, base_delay_sec=1.0))
-    circuit_breaker: CircuitBreakerConfig = field(default_factory=CircuitBreakerConfig)
-    loop_detect_threshold: int = 3
-    allowed_tools: Optional[List[str]] = None  # None の場合は全ツールを許可
-    verbose: bool = False  # True の場合は詳細ログを出力
-
-
-# --------------------------------------------------------------------------- #
-# メインハーネスクラス
-# --------------------------------------------------------------------------- #
-
-class AgentHarness:
-    """
-    AIエージェントハーネスのメインクラス。
-
-    このクラスがエージェントのライフサイクル全体を管理します:
-    - ReAct ループの制御（思考→行動→観察）
-    - 状態機械による進捗管理
-    - ツールレジストリとの統合
-    - メモリ管理（短期・長期）
-    - エラーハンドリング（リトライ・フォールバック・サーキットブレーカー）
-    - ループ検出と暴走防止
-
-    使い方:
-        config = HarnessConfig(model_id="anthropic.claude-sonnet-4-5")
-        harness = AgentHarness(config)
-        result = harness.run("2 + 3 * 4 を計算してください")
-        print(result)
+    3状態ステートマシンによるサーキットブレーカー。
+    LLM APIの一時的障害からシステム全体を保護する。
     """
 
     def __init__(
         self,
-        config: Optional[HarnessConfig] = None,
-        tool_registry: Optional[ToolRegistry] = None,
-        memory: Optional[MemoryManager] = None,
+        failure_threshold: int = 5,
+        recovery_timeout: float = 30.0,
+        half_open_max_calls: int = 2,
     ) -> None:
-        self.config = config or HarnessConfig()
-        self.tools = tool_registry or default_registry
-        self.memory = memory or MemoryManager(
-            max_context_tokens=self.config.budget.max_tokens_total // 4,
-        )
-        self.error_handler = AgentErrorHandler(
-            retry_config=self.config.retry,
-            circuit_config=self.config.circuit_breaker,
-        )
-        self.loop_detector = LoopDetector(self.config.loop_detect_threshold)
+        self.failure_threshold = failure_threshold
+        self.recovery_timeout = recovery_timeout
+        self.half_open_max_calls = half_open_max_calls
 
-        # 状態管理
-        self._state = AgentState.IDLE
-        self._state_history: List[AgentStateRecord] = []
+        self._state = CircuitState.CLOSED
+        self._failure_count = 0
+        self._last_failure_time: Optional[float] = None
+        self._half_open_calls = 0
 
-        # 実行統計
-        self._turn_count = 0
-        self._tool_call_count = 0
-        self._total_tokens_est = 0
-        self._start_time: float = 0.0
+    @property
+    def state(self) -> CircuitState:
+        # OPEN 状態でも回復タイムアウト経過後は HALF_OPEN へ自動遷移
+        if (
+            self._state == CircuitState.OPEN
+            and self._last_failure_time is not None
+            and time.monotonic() - self._last_failure_time >= self.recovery_timeout
+        ):
+            self._state = CircuitState.HALF_OPEN
+            self._half_open_calls = 0
+        return self._state
 
-        # システムプロンプトをメモリに設定
-        self.memory.working.set_system_prompt(self.config.system_prompt)
+    def allow_request(self) -> bool:
+        s = self.state
+        if s == CircuitState.CLOSED:
+            return True
+        if s == CircuitState.HALF_OPEN:
+            return self._half_open_calls < self.half_open_max_calls
+        return False  # OPEN
 
-    # ---------------------------------------------------------------- #
-    # メインエントリポイント
-    # ---------------------------------------------------------------- #
+    def record_success(self) -> None:
+        if self._state == CircuitState.HALF_OPEN:
+            self._half_open_calls += 1
+            if self._half_open_calls >= self.half_open_max_calls:
+                logger.info("[CircuitBreaker] 回復確認完了 → CLOSED に遷移")
+                self._state = CircuitState.CLOSED
+                self._failure_count = 0
 
-    def run(self, user_input: str) -> str:
+    def record_failure(self) -> None:
+        self._failure_count += 1
+        self._last_failure_time = time.monotonic()
+        if self._failure_count >= self.failure_threshold:
+            logger.warning(
+                "[CircuitBreaker] 障害しきい値超過 → OPEN に遷移 "
+                f"(failures={self._failure_count})"
+            )
+            self._state = CircuitState.OPEN
+
+
+# ---------------------------------------------------------------------------
+# ハーネス本体
+# ---------------------------------------------------------------------------
+
+class AgentHarness:
+    """
+    AIエージェントハーネス本体。
+
+    責務:
+      - エージェントループの制御（何ターン・どのツールを・いつ呼ぶか）
+      - ツール実行と結果のLLMへのフィードバック
+      - コンテキストウィンドウの監視と自動コンパクション
+      - ライフサイクルフックによる外部制約の強制
+      - 指数バックオフ付きリトライ＋サーキットブレーカー
+      - 観測性テレメトリ（トレース・メトリクス・ログ）の収集
+
+    使い方:
+        harness = AgentHarness(config=AgentConfig(), tools=my_registry)
+        harness.add_hook(HookEvent.PRE_TOOL_USE, audit_hook)
+        result = harness.run("コードベースのバグを修正してください")
+    """
+
+    def __init__(
+        self,
+        config: AgentConfig,
+        tools: ToolRegistry,
+        memory: Optional[MemoryManager] = None,
+        obs: Optional[ObservabilityCollector] = None,
+    ) -> None:
+        self.config = config
+        self.tools = tools
+        self.memory = memory or MemoryManager()
+        self.obs = obs or ObservabilityCollector()
+        self._hooks: dict[HookEvent, list[Callable[[HookContext], None]]] = {
+            e: [] for e in HookEvent
+        }
+        self._circuit_breaker = CircuitBreaker()
+        # Anthropic クライアント（APIキーは環境変数 ANTHROPIC_API_KEY から自動取得）
+        self._client = anthropic.Anthropic()
+
+    # ------------------------------------------------------------------
+    # フック登録 API
+    # ------------------------------------------------------------------
+
+    def add_hook(self, event: HookEvent, fn: Callable[[HookContext], None]) -> None:
+        """指定イベントにフック関数を登録する"""
+        self._hooks[event].append(fn)
+
+    def _fire_hook(self, ctx: HookContext) -> HookContext:
+        """登録済みフックを順番に実行し、コンテキストを返す"""
+        for fn in self._hooks[ctx.event]:
+            fn(ctx)
+            if ctx.block:
+                logger.warning(
+                    f"[Hook] ツール '{ctx.tool_name}' がブロックされました: {ctx.block_reason}"
+                )
+                break
+        return ctx
+
+    # ------------------------------------------------------------------
+    # メインエージェントループ
+    # ------------------------------------------------------------------
+
+    def run(self, user_prompt: str, session_id: Optional[str] = None) -> str:
         """
-        エージェントを実行してタスクを解決する。
+        ユーザープロンプトを受け取り、エージェントループを実行して最終応答を返す。
 
-        Args:
-            user_input: ユーザーからの指示・質問
+        Parameters
+        ----------
+        user_prompt : str
+            ユーザーからの指示・質問
+        session_id : str, optional
+            セッションID（省略時は自動生成）。再開時は同じIDを渡す。
 
-        Returns:
-            エージェントの最終応答テキスト
-
-        Raises:
-            RuntimeError: エラー状態またはアボート状態で終了した場合
+        Returns
+        -------
+        str
+            エージェントの最終テキスト応答
         """
-        self._start_time = time.time()
-        self._transition_state(AgentState.PLANNING, "新規タスク開始")
+        session_id = session_id or str(uuid.uuid4())
+        root_span = self.obs.start_span("agent_run", {"session_id": session_id})
 
-        # ユーザーメッセージをメモリに追加
-        self.memory.add_user_message(user_input)
+        # セッション開始フック
+        self._fire_hook(HookContext(HookEvent.SESSION_START, session_id))
 
-        logger.info("エージェント実行開始: input='%s'", user_input[:50])
+        # メモリから関連コンテキストを取得してシステムプロンプトに注入
+        memory_ctx = self.memory.retrieve_relevant(user_prompt, top_k=5)
+        system_prompt = self._build_system_prompt(memory_ctx)
+
+        messages: list[dict] = [{"role": "user", "content": user_prompt}]
+        tool_definitions = self.tools.get_definitions()
 
         try:
-            final_answer = self._react_loop()
-            self._transition_state(AgentState.COMPLETED, "タスク完了")
-            return final_answer
+            for turn in range(self.config.max_turns):
+                # コンテキストサイズの監視と自動コンパクション
+                messages = self._maybe_compact(messages, session_id)
+
+                # LLM呼び出し（リトライ＋サーキットブレーカー付き）
+                response = self._call_llm_with_retry(
+                    messages=messages,
+                    system=system_prompt,
+                    tools=tool_definitions,
+                    span=root_span,
+                )
+
+                # 停止理由の分岐
+                if response.stop_reason == "end_turn":
+                    # ツール呼び出しなし → 最終応答
+                    final_text = self._extract_text(response)
+                    self.memory.store(user_prompt, final_text)
+                    self.obs.end_span(root_span, {"turns": turn + 1, "status": "success"})
+                    return final_text
+
+                if response.stop_reason == "tool_use":
+                    # ツール呼び出しを処理してメッセージ履歴に追加
+                    messages = self._process_tool_calls(
+                        response=response,
+                        messages=messages,
+                        session_id=session_id,
+                    )
+                    continue
+
+                # その他の停止理由（max_tokens 等）
+                logger.warning(f"[Turn {turn}] 予期しない stop_reason: {response.stop_reason}")
+                break
+
+            # 最大ターン数到達
+            logger.error(f"最大ターン数 {self.config.max_turns} に到達しました")
+            self.obs.end_span(root_span, {"status": "max_turns_exceeded"})
+            return "[エラー] エージェントが最大ターン数に達しました。タスクを分割して再試行してください。"
+
         except Exception as exc:
-            self._transition_state(AgentState.ERROR, f"エラー: {exc}")
-            logger.error("エージェント実行エラー: %s", exc, exc_info=True)
+            logger.exception(f"エージェントループで例外が発生: {exc}")
+            self.obs.end_span(root_span, {"status": "error", "error": str(exc)})
             raise
-        finally:
-            elapsed = time.time() - self._start_time
-            logger.info(
-                "実行完了: turns=%d tool_calls=%d elapsed=%.2fs state=%s",
-                self._turn_count,
-                self._tool_call_count,
-                elapsed,
-                self._state.value,
-            )
 
-    # ---------------------------------------------------------------- #
-    # ReAct ループ
-    # ---------------------------------------------------------------- #
+    # ------------------------------------------------------------------
+    # LLM呼び出し（リトライ＋サーキットブレーカー）
+    # ------------------------------------------------------------------
 
-    def _react_loop(self) -> str:
-        """
-        ReAct（Reasoning + Acting）ループの実装。
-
-        ループ継続条件:
-        1. stop_reason == "end_turn"  → LLM が最終応答を返した → ループ終了
-        2. stop_reason == "tool_use"  → LLM がツール呼び出しを要求 → ツール実行→継続
-        3. バジェット上限到達        → ABORTED 状態で中断
-        4. ループ検出（同一状態繰り返し）→ ABORTED 状態で中断
-
-        【重要な理解】
-        モデルは「自律的に決定している」のではなく、
-        ツール実行結果を含む完全な会話履歴（messages[]）を受け取り
-        次のトークンを生成しているだけです。
-        透明性が高くデバッグが容易なのはこのためです。
-        """
-        while True:
-            # --- バジェットチェック ---
-            if not self._check_budget():
-                self._transition_state(AgentState.ABORTED, "バジェット上限到達")
-                return "エージェントが実行上限に達したため処理を中断しました。"
-
-            # --- ループ検出 ---
-            context_hash = self.memory.content_hash()
-            if self.loop_detector.check(context_hash):
-                self._transition_state(AgentState.ABORTED, "無限ループ検出")
-                logger.warning("無限ループを検出しました。エージェントを停止します。")
-                return "エージェントが同じ操作を繰り返しているため処理を中断しました。"
-
-            # --- LLM 呼び出し ---
-            self._turn_count += 1
-            self._transition_state(AgentState.PLANNING, f"ターン {self._turn_count}")
-
-            response = self._call_llm_with_protection()
-            stop_reason = response.get("stop_reason", "end_turn")
-            content = response.get("content", [])
-
-            if self.config.verbose:
-                logger.debug("LLM応答: stop_reason=%s content_blocks=%d", stop_reason, len(content))
-
-            # --- 停止条件: LLM が最終応答を返した ---
-            if stop_reason == "end_turn":
-                final_text = self._extract_text(content)
-                self.memory.add_assistant_message(final_text)
-                return final_text
-
-            # --- ツール呼び出し要求: ツールを実行してコンテキストに追加 ---
-            if stop_reason == "tool_use":
-                self._transition_state(AgentState.EXECUTING, "ツール実行")
-                tool_results = self._execute_tools(content)
-
-                # アシスタントのターンをメモリに追加
-                assistant_content = self._extract_text(content)
-                if assistant_content:
-                    self.memory.add_assistant_message(assistant_content)
-
-                # ツール結果をメモリに追加（user ロールで返すのが Converse API の仕様）
-                tool_result_text = json.dumps(tool_results, ensure_ascii=False)
-                self.memory.add_user_message(f"[ツール実行結果]\n{tool_result_text}")
-
-                self._transition_state(AgentState.VERIFYING, "ツール結果検証")
-                continue
-
-            # --- 未知の stop_reason ---
-            logger.warning("未知の stop_reason: %s", stop_reason)
-            return self._extract_text(content) or "処理を完了しました。"
-
-    # ---------------------------------------------------------------- #
-    # LLM 呼び出し（エラーハンドリング付き）
-    # ---------------------------------------------------------------- #
-
-    def _call_llm_with_protection(self) -> Dict[str, Any]:
-        """
-        エラーハンドリング（リトライ + サーキットブレーカー）付きの LLM 呼び出し。
-        """
-        messages = self.memory.get_context_messages()
-        tool_schema = self.tools.get_schema(self.config.allowed_tools)
-
-        def primary_call() -> Dict[str, Any]:
-            return self._call_llm(messages, tool_schema)
-
-        return self.error_handler.execute_with_protection(
-            primary_func=primary_call,
-            provider_name=self.config.model_id,
-        )
-
-    def _call_llm(
+    def _call_llm_with_retry(
         self,
-        messages: List[Dict[str, Any]],
-        tool_schema: List[Dict[str, Any]],
-    ) -> Dict[str, Any]:
+        messages: list[dict],
+        system: str,
+        tools: list[dict],
+        span: Span,
+    ) -> Any:
         """
-        LLM を実際に呼び出す低レベルメソッド。
+        指数バックオフ付きリトライ＋サーキットブレーカーで LLM を呼び出す。
 
-        BEDROCK_CLIENT_AVAILABLE が True の場合は boto3 の Converse API を使用します。
-        False の場合はスタブレスポンスを返します（テスト・デモ用）。
-
-        【本番実装例（AWS Bedrock）】
-        import boto3
-        client = boto3.client("bedrock-runtime", region_name="us-west-2")
-        response = client.converse(
-            modelId=self.config.model_id,
-            system=[{"text": self.config.system_prompt}],
-            messages=messages,
-            toolConfig={"tools": tool_schema} if tool_schema else {},
-        )
-        return {
-            "stop_reason": response["stopReason"],
-            "content": response["output"]["message"]["content"],
-        }
+        リトライ戦略:
+          - 一時的障害（レートリミット・ネットワーク等）: 指数バックオフで再試行
+          - 恒久的障害: サーキットブレーカーで早期失敗してシステムを保護
         """
-        if BEDROCK_CLIENT_AVAILABLE:
-            import boto3  # type: ignore[import]
-            client = boto3.client("bedrock-runtime", region_name="us-west-2")
-            response = client.converse(
-                modelId=self.config.model_id,
-                system=[{"text": self.config.system_prompt}],
-                messages=messages,
-                toolConfig={"tools": tool_schema} if tool_schema else {},
-            )
-            return {
-                "stop_reason": response["stopReason"],
-                "content": response["output"]["message"]["content"],
-            }
+        last_exc: Optional[Exception] = None
 
-        # --- スタブ実装（boto3 未使用時のデモ用） ---
-        return self._stub_llm_response(messages, tool_schema)
+        for attempt in range(self.config.retry_max):
+            if not self._circuit_breaker.allow_request():
+                raise RuntimeError(
+                    "サーキットブレーカーが OPEN 状態です。LLM API への呼び出しを一時停止中。"
+                )
 
-    def _stub_llm_response(
-        self,
-        messages: List[Dict[str, Any]],
-        tool_schema: List[Dict[str, Any]],
-    ) -> Dict[str, Any]:
-        """
-        boto3 が不要なスタブ LLM 応答（デモ・テスト用）。
-
-        最後のユーザーメッセージを解析し、ツールが利用可能な場合は
-        calculator ツールの呼び出しを模倣します。
-        """
-        if not messages:
-            return {"stop_reason": "end_turn", "content": [{"text": "メッセージがありません。"}]}
-
-        last_msg = messages[-1]
-        last_text = ""
-        if isinstance(last_msg.get("content"), list):
-            for block in last_msg["content"]:
-                if "text" in block:
-                    last_text = block["text"]
-                    break
-
-        # ツール結果が含まれている場合（tool_use ループの2回目以降）
-        if "[ツール実行結果]" in last_text:
             try:
-                result_json = last_text.replace("[ツール実行結果]\n", "")
-                results = json.loads(result_json)
-                if results:
-                    tool_result = results[0].get("result", "不明")
-                    return {
-                        "stop_reason": "end_turn",
-                        "content": [{"text": f"計算結果は {tool_result} です。"}],
-                    }
-            except Exception:
-                pass
-            return {"stop_reason": "end_turn", "content": [{"text": "ツールの実行が完了しました。"}]}
+                llm_span = self.obs.start_span(
+                    "llm_call",
+                    {"model": self.config.model, "attempt": attempt},
+                    parent=span,
+                )
 
-        # 計算式が含まれている場合 → calculator ツールを呼び出すスタブ
-        available_tool_names = [s["toolSpec"]["name"] for s in tool_schema]
-        if "calculator" in available_tool_names and any(
-            op in last_text for op in ["+", "-", "*", "/", "計算", "calc"]
-        ):
-            import re
-            expr_match = re.search(r"[\d\s\+\-\*\/\(\)\.]+", last_text)
-            expression = expr_match.group(0).strip() if expr_match else "1 + 1"
-            return {
-                "stop_reason": "tool_use",
-                "content": [
-                    {"text": f"数式を検出しました。calculator ツールを呼び出します。"},
-                    {
-                        "toolUse": {
-                            "toolUseId": f"tool_use_{int(time.time())}",
-                            "name": "calculator",
-                            "input": {"expression": expression},
+                # プロンプトキャッシュを有効化する場合はシステムプロンプトに
+                # cache_control を付与（大きなシステムプロンプトのトークンコスト削減）
+                system_param: Any = system
+                if self.config.enable_prompt_cache:
+                    system_param = [
+                        {
+                            "type": "text",
+                            "text": system,
+                            "cache_control": {"type": "ephemeral"},
                         }
+                    ]
+
+                response = self._client.messages.create(
+                    model=self.config.model,
+                    max_tokens=self.config.max_tokens,
+                    system=system_param,
+                    messages=messages,
+                    tools=tools,
+                )
+
+                self._circuit_breaker.record_success()
+                self.obs.end_span(
+                    llm_span,
+                    {
+                        "input_tokens": response.usage.input_tokens,
+                        "output_tokens": response.usage.output_tokens,
+                        "stop_reason": response.stop_reason,
                     },
-                ],
-            }
+                )
+                return response
 
-        # デフォルト: そのままテキストで応答
-        return {
-            "stop_reason": "end_turn",
-            "content": [{"text": f"入力「{last_text[:100]}」を処理しました。（スタブ応答）"}],
-        }
+            except anthropic.RateLimitError as exc:
+                # レートリミットは一時的障害 → リトライ対象
+                last_exc = exc
+                self._circuit_breaker.record_failure()
+                delay = self.config.retry_base_delay * (2 ** attempt)
+                logger.warning(f"[Retry {attempt+1}] レートリミット。{delay:.1f}秒後に再試行...")
+                time.sleep(delay)
 
-    # ---------------------------------------------------------------- #
-    # ツール実行
-    # ---------------------------------------------------------------- #
+            except anthropic.APIConnectionError as exc:
+                # ネットワーク障害 → リトライ対象
+                last_exc = exc
+                self._circuit_breaker.record_failure()
+                delay = self.config.retry_base_delay * (2 ** attempt)
+                logger.warning(f"[Retry {attempt+1}] 接続エラー。{delay:.1f}秒後に再試行...")
+                time.sleep(delay)
 
-    def _execute_tools(self, content: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+            except anthropic.APIStatusError as exc:
+                # 4xx 系クライアントエラーはリトライ不可
+                self._circuit_breaker.record_failure()
+                raise
+
+        raise RuntimeError(
+            f"LLM呼び出しが {self.config.retry_max} 回リトライ後も失敗しました"
+        ) from last_exc
+
+    # ------------------------------------------------------------------
+    # ツール呼び出し処理
+    # ------------------------------------------------------------------
+
+    def _process_tool_calls(
+        self,
+        response: Any,
+        messages: list[dict],
+        session_id: str,
+    ) -> list[dict]:
         """
-        LLM レスポンスに含まれるすべてのツール呼び出しを実行する。
+        LLMからのツール呼び出しリクエストを処理し、結果をメッセージ履歴に追加する。
 
-        Returns:
-            ツール実行結果のリスト（Converse API の toolResult 形式）
+        セキュリティ: 外部データ（ツール結果）はすべて非信頼として扱い、
+        フックがブロックできる設計になっている。
         """
-        results = []
-        for block in content:
-            tool_use = block.get("toolUse")
-            if not tool_use:
+        # アシスタントの応答をメッセージ履歴に追加
+        messages.append({"role": "assistant", "content": response.content})
+
+        tool_results = []
+
+        for content_block in response.content:
+            if content_block.type != "tool_use":
                 continue
 
-            tool_name = tool_use["name"]
-            tool_input = tool_use.get("input", {})
-            tool_use_id = tool_use["toolUseId"]
-            self._tool_call_count += 1
+            tool_name = content_block.name
+            tool_input = content_block.input
+            tool_use_id = content_block.id
 
-            logger.info("ツール実行: name=%s input=%s", tool_name, tool_input)
+            # PRE_TOOL_USE フック（監査ログ・ブロック・入力変換に使用）
+            hook_ctx = self._fire_hook(
+                HookContext(
+                    event=HookEvent.PRE_TOOL_USE,
+                    session_id=session_id,
+                    tool_name=tool_name,
+                    tool_input=tool_input,
+                )
+            )
 
+            if hook_ctx.block:
+                # フックがブロックした場合はエラー結果を返す
+                tool_results.append({
+                    "type": "tool_result",
+                    "tool_use_id": tool_use_id,
+                    "is_error": True,
+                    "content": f"ツール '{tool_name}' はポリシーによりブロックされました: {hook_ctx.block_reason}",
+                })
+                continue
+
+            # ツール実行
+            tool_span = self.obs.start_span(
+                "tool_call", {"tool": tool_name, "session": session_id}
+            )
             try:
-                result = self.tools.call(tool_name, **tool_input)
-                results.append({
-                    "toolUseId": tool_use_id,
-                    "tool": tool_name,
-                    "result": result,
-                    "status": "success",
-                })
-                logger.debug("ツール成功: name=%s result=%s", tool_name, str(result)[:100])
+                result = self.tools.execute(tool_name, tool_input)
+                is_error = False
             except Exception as exc:
-                # ツール失敗はエージェントに通知し、再試行・代替手段を検討させる
-                error_msg = f"ツール '{tool_name}' の実行中にエラーが発生しました: {exc}"
-                results.append({
-                    "toolUseId": tool_use_id,
-                    "tool": tool_name,
-                    "result": error_msg,
-                    "status": "error",
-                })
-                logger.warning("ツールエラー: name=%s error=%s", tool_name, exc)
+                result = f"ツール実行エラー: {exc}"
+                is_error = True
+                logger.error(f"[Tool] '{tool_name}' 実行失敗: {exc}")
 
-        return results
+            self.obs.end_span(tool_span, {"is_error": is_error})
 
-    # ---------------------------------------------------------------- #
-    # 状態管理
-    # ---------------------------------------------------------------- #
+            # POST_TOOL_USE フック（結果の検証・変換・ログに使用）
+            self._fire_hook(
+                HookContext(
+                    event=HookEvent.POST_TOOL_USE,
+                    session_id=session_id,
+                    tool_name=tool_name,
+                    tool_input=tool_input,
+                    tool_result=result,
+                )
+            )
 
-    def _transition_state(self, new_state: AgentState, reason: str = "") -> None:
-        """状態遷移を記録し、ログに出力する。"""
-        record = AgentStateRecord(
-            from_state=self._state,
-            to_state=new_state,
-            reason=reason,
-            turn_number=self._turn_count,
-        )
-        self._state_history.append(record)
-        logger.debug(
-            "状態遷移: %s → %s [理由: %s]",
-            self._state.value,
-            new_state.value,
-            reason,
-        )
-        self._state = new_state
+            tool_results.append({
+                "type": "tool_result",
+                "tool_use_id": tool_use_id,
+                "is_error": is_error,
+                "content": str(result),
+            })
 
-    def _check_budget(self) -> bool:
+        messages.append({"role": "user", "content": tool_results})
+        return messages
+
+    # ------------------------------------------------------------------
+    # コンテキスト管理
+    # ------------------------------------------------------------------
+
+    def _maybe_compact(self, messages: list[dict], session_id: str) -> list[dict]:
         """
-        バジェット（実行上限）を確認する。
+        コンテキストウィンドウ使用量が閾値を超えた場合に自動コンパクション
+        （古いメッセージを要約して圧縮）を実行する。
 
-        Returns:
-            True の場合は継続可能、False の場合は中断すべき
+        コンパクションはコンテキスト腐敗（Context Rot）を防ぎ、
+        長時間タスクの継続を可能にする。
         """
-        budget = self.config.budget
-        elapsed = time.time() - self._start_time
+        estimated_tokens = self._estimate_token_count(messages)
+        threshold_tokens = int(self.config.context_window_limit * self.config.compact_threshold)
 
-        if self._turn_count >= budget.max_turns:
-            logger.warning("最大ターン数 (%d) に達しました", budget.max_turns)
-            return False
-        if self._tool_call_count >= budget.max_tool_calls:
-            logger.warning("最大ツール呼び出し数 (%d) に達しました", budget.max_tool_calls)
-            return False
-        if elapsed >= budget.global_timeout_sec:
-            logger.warning("グローバルタイムアウト (%.1f秒) に達しました", budget.global_timeout_sec)
-            return False
+        if estimated_tokens < threshold_tokens:
+            return messages
 
-        return True
+        logger.info(
+            f"[Compact] コンテキスト使用量 {estimated_tokens} トークンが閾値 "
+            f"{threshold_tokens} を超過。コンパクションを実行します..."
+        )
+        self._fire_hook(HookContext(HookEvent.PRE_COMPACT, session_id))
 
-    # ---------------------------------------------------------------- #
-    # ユーティリティ
-    # ---------------------------------------------------------------- #
+        # 最初のユーザーメッセージと直近 N ターンは保持し、中間部分を要約で置換
+        # （実際の要約ロジックはLLMを使用する — ここはスケルトン）
+        compacted = self._summarize_old_messages(messages)
 
-    @staticmethod
-    def _extract_text(content: List[Dict[str, Any]]) -> str:
-        """コンテンツブロックのリストからテキストを抽出する。"""
-        texts = [block["text"] for block in content if "text" in block]
-        return " ".join(texts)
+        self._fire_hook(HookContext(HookEvent.POST_COMPACT, session_id))
+        logger.info(f"[Compact] 完了。{len(messages)} → {len(compacted)} メッセージに削減")
+        return compacted
 
-    def get_stats(self) -> Dict[str, Any]:
-        """実行統計情報を返す（監視・デバッグ用）。"""
-        return {
-            "state": self._state.value,
-            "turn_count": self._turn_count,
-            "tool_call_count": self._tool_call_count,
-            "elapsed_sec": round(time.time() - self._start_time, 2) if self._start_time else 0,
-            "circuit_breakers": self.error_handler.get_all_circuit_status(),
-            "memory_state": self.memory.dump_state(),
-        }
+    def _summarize_old_messages(self, messages: list[dict]) -> list[dict]:
+        """
+        古いメッセージ群をLLMで要約し、コンテキストを削減する（スケルトン）。
+        本番実装では別LLM呼び出しで要約テキストを生成すること。
+        """
+        if len(messages) <= 4:
+            return messages
 
-    def get_state_history(self) -> List[Dict[str, Any]]:
-        """状態遷移の履歴を返す（デバッグ用）。"""
+        # 最初のシステム設定メッセージ + 直近4ターンを保持
+        keep_recent = 4
+        old_messages = messages[:-keep_recent]
+        recent_messages = messages[-keep_recent:]
+
+        # TODO: 実際には LLM 呼び出しで old_messages を要約テキストに変換する
+        summary_text = f"[会話履歴の要約: {len(old_messages)}件のメッセージが圧縮されました]"
+
         return [
-            {
-                "from": r.from_state.value,
-                "to": r.to_state.value,
-                "reason": r.reason,
-                "turn": r.turn_number,
-            }
-            for r in self._state_history
+            {"role": "user", "content": summary_text},
+            {"role": "assistant", "content": "了解しました。要約された文脈を把握しました。"},
+            *recent_messages,
         ]
 
+    # ------------------------------------------------------------------
+    # ユーティリティ
+    # ------------------------------------------------------------------
 
-# --------------------------------------------------------------------------- #
-# 動作確認エントリポイント
-# --------------------------------------------------------------------------- #
+    def _build_system_prompt(self, memory_ctx: list[str]) -> str:
+        """メモリコンテキストを注入したシステムプロンプトを構築する"""
+        base = (
+            "あなたは優秀なAIアシスタントです。"
+            "与えられたツールを使って、ユーザーのタスクを段階的に解決してください。"
+            "不確かな場合は確認してから行動し、破壊的な操作は慎重に行ってください。"
+        )
+        if memory_ctx:
+            ctx_block = "\n".join(f"- {c}" for c in memory_ctx)
+            return f"{base}\n\n## 関連する過去のコンテキスト\n{ctx_block}"
+        return base
+
+    def _extract_text(self, response: Any) -> str:
+        """レスポンスからテキストコンテンツを抽出する"""
+        parts = [
+            block.text
+            for block in response.content
+            if hasattr(block, "text")
+        ]
+        return "\n".join(parts)
+
+    def _estimate_token_count(self, messages: list[dict]) -> int:
+        """メッセージリストのトークン数を概算する（4文字≒1トークン）"""
+        total_chars = sum(
+            len(str(msg.get("content", ""))) for msg in messages
+        )
+        return total_chars // 4
+
+
+# ---------------------------------------------------------------------------
+# 使用例
+# ---------------------------------------------------------------------------
+
+def example_audit_hook(ctx: HookContext) -> None:
+    """
+    監査ログフックの例。
+    PRE_TOOL_USE に登録することで、全ツール呼び出しを記録できる。
+    """
+    if ctx.event == HookEvent.PRE_TOOL_USE:
+        logger.info(f"[Audit] ツール呼び出し: {ctx.tool_name} | 入力: {ctx.tool_input}")
+
+
+def example_block_hook(ctx: HookContext) -> None:
+    """
+    危険なコマンドをブロックするフックの例。
+    rm -rf などの破壊的コマンドを実行前に遮断する。
+    """
+    DANGEROUS_COMMANDS = ["rm -rf", "DROP TABLE", "format c:", ":(){ :|:& };:"]
+    if ctx.event == HookEvent.PRE_TOOL_USE and ctx.tool_name == "bash":
+        command = str(ctx.tool_input or "")
+        for dangerous in DANGEROUS_COMMANDS:
+            if dangerous in command:
+                ctx.block = True
+                ctx.block_reason = f"危険なコマンドパターン '{dangerous}' が検出されました"
+                return
+
 
 if __name__ == "__main__":
-    logging.basicConfig(
-        level=logging.INFO,
-        format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
+    # 基本的な動作確認（APIキーは環境変数 ANTHROPIC_API_KEY に設定しておくこと）
+    import os
+    from tools import ToolRegistry, EchoTool
+
+    logging.basicConfig(level=logging.INFO)
+
+    # ツールレジストリのセットアップ
+    registry = ToolRegistry()
+    registry.register(EchoTool())
+
+    # ハーネスの設定と初期化
+    config = AgentConfig(
+        model="claude-opus-4-7",
+        max_turns=5,
+        enable_prompt_cache=True,
     )
+    harness = AgentHarness(config=config, tools=registry)
 
-    print("=" * 60)
-    print("  AIエージェントハーネス 動作確認")
-    print("=" * 60)
-    print()
+    # フックの登録（監査ログ＋危険コマンドブロック）
+    harness.add_hook(HookEvent.PRE_TOOL_USE, example_audit_hook)
+    harness.add_hook(HookEvent.PRE_TOOL_USE, example_block_hook)
 
-    # --- ハーネスの設定 ---
-    config = HarnessConfig(
-        model_id="anthropic.claude-sonnet-4-5",
-        system_prompt="あなたは計算・時刻取得などのツールを使えるアシスタントです。",
-        budget=BudgetConfig(max_turns=10, max_tool_calls=20, global_timeout_sec=60.0),
-        retry=RetryConfig(max_attempts=2, base_delay_sec=0.5),
-        verbose=True,
-    )
-
-    harness = AgentHarness(config)
-
-    # --- テストケース1: 計算タスク ---
-    print("[テスト1] 計算タスク:")
-    try:
-        result = harness.run("2 + 3 * 4 を計算してください")
-        print(f"  応答: {result}")
-    except Exception as e:
-        print(f"  エラー: {e}")
-
-    # 統計情報の表示
-    stats = harness.get_stats()
-    print(f"\n  実行統計:")
-    print(f"    ターン数: {stats['turn_count']}")
-    print(f"    ツール呼び出し数: {stats['tool_call_count']}")
-    print(f"    経過時間: {stats['elapsed_sec']}秒")
-
-    # --- テストケース2: 現在時刻取得 ---
-    print("\n[テスト2] 時刻取得タスク:")
-    harness2 = AgentHarness(config)
-    try:
-        result2 = harness2.run("現在の時刻を教えてください")
-        print(f"  応答: {result2}")
-    except Exception as e:
-        print(f"  エラー: {e}")
-
-    # --- 状態遷移履歴の表示 ---
-    print("\n[状態遷移履歴]:")
-    for record in harness.get_state_history():
-        print(f"  ターン{record['turn']:2d}: {record['from']:10s} → {record['to']:10s}  ({record['reason']})")
-
-    # --- メモリ状態の表示 ---
-    print("\n[メモリ状態]:")
-    print(json.dumps(harness.memory.dump_state(), ensure_ascii=False, indent=2))
-
-    print("\n" + "=" * 60)
-    print("  動作確認完了")
-    print("=" * 60)
+    # エージェント実行
+    answer = harness.run("こんにちは！テストメッセージをエコーしてください。")
+    print(f"\n=== エージェント応答 ===\n{answer}")
