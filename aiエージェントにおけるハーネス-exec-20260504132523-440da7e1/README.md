@@ -400,4 +400,4 @@ terraform destroy -var="project_name=myagent-harness"
 
 ---
 
-📝 [Notionで詳細を見る]()
+📝 [Notionで詳細を見る](https://www.notion.so/AI-35647b55202e81e09791eedf10aa10ed)
