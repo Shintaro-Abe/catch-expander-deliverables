@@ -297,4 +297,4 @@ def handler(event, context):
 
 ---
 
-📝 [Notionで詳細を見る]()
+📝 [Notionで詳細を見る](https://www.notion.so/Data-API-35947b55202e813581cdfe08c0521290)
