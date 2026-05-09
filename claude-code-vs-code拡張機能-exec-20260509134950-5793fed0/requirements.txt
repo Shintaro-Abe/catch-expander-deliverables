@@ -1,0 +1,6 @@
+# PoC品質: Claude Code VS Code拡張機能 デモの依存パッケージ
+# インストール: pip install -r requirements.txt
+
+# Anthropic Python SDK（Claude API クライアント）
+# 最新バージョン推奨: https://github.com/anthropics/anthropic-sdk-python
+anthropic>=0.52.0
