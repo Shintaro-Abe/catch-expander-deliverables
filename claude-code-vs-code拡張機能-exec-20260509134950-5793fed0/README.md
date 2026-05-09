@@ -185,4 +185,4 @@ system=[{
 
 ---
 
-📝 [Notionで詳細を見る]()
+📝 [Notionで詳細を見る](https://www.notion.so/Claude-Code-VS-Code-35b47b55202e81d7bb1ccd46e7d62104)
