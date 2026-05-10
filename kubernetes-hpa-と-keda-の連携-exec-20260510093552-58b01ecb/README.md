@@ -346,4 +346,4 @@ helm install keda kedacore/keda \
 
 ---
 
-📝 [Notionで詳細を見る]()
+📝 [Notionで詳細を見る](https://www.notion.so/Kubernetes-HPA-KEDA-35c47b55202e814d84a8d984030b29b2)
