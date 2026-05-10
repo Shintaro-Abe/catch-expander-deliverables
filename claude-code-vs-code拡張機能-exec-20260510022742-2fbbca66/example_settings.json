@@ -1,0 +1,55 @@
+{
+  "$schema": "https://json.schemastore.org/claude-code-settings.json",
+
+  "model": "claude-sonnet-4-6",
+
+  "permissions": {
+    "defaultMode": "default",
+
+    "allow": [
+      "Bash(npm run lint)",
+      "Bash(npm run test *)",
+      "Bash(npm run build)",
+      "Bash(python -m pytest *)",
+      "Bash(ruff check *)",
+      "Bash(black *)",
+      "Bash(mypy *)",
+      "Bash(git status)",
+      "Bash(git diff *)",
+      "Bash(git add *)",
+      "Bash(git log *)"
+    ],
+
+    "deny": [
+      "Bash(rm -rf *)",
+      "Bash(sudo *)",
+      "Bash(chmod 777 *)",
+      "Read(.env)",
+      "Read(./secrets/**)"
+    ],
+
+    "ask": [
+      "Bash(git push *)",
+      "Bash(git commit *)"
+    ]
+  },
+
+  "hooks": {
+    "PostToolUse": [
+      {
+        "matcher": "Edit",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "echo \"File edited: $FILE\""
+          }
+        ]
+      }
+    ]
+  },
+
+  "env": {
+    "DISABLE_TELEMETRY": "1",
+    "CLAUDE_CODE_MAX_OUTPUT_TOKENS": "32000"
+  }
+}
