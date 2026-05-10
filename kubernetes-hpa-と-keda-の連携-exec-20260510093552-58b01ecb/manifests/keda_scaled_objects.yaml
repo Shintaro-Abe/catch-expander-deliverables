@@ -1,0 +1,218 @@
+# PoC品質: このマニフェストは学習・検証用です。本番利用前にリソース値・認証設定・閾値を見直してください。
+# 適用コマンド: kubectl apply -f manifests/keda_scaled_objects.yaml
+
+---
+# ============================================================
+# TriggerAuthentication: IRSA (IAM Roles for Service Accounts) 設定
+# ============================================================
+# 【目的】
+# ScaledObject から認証情報を分離するためのリソース。
+# AWS環境では IRSA または EKS Pod Identity を使用し、
+# クレデンシャルをYAMLにハードコードしないことが必須。
+# 【前提】
+# keda-operatorのServiceAccountに以下のアノテーションが付与済みであること:
+#   eks.amazonaws.com/role-arn: arn:aws:iam::ACCOUNT_ID:role/keda-operator
+apiVersion: keda.sh/v1alpha1
+kind: TriggerAuthentication
+metadata:
+  name: keda-aws-irsa-auth
+  namespace: demo
+spec:
+  podIdentity:
+    provider: aws  # KEDA 2.13+ 推奨値（旧: aws-eks は非推奨）
+
+---
+# ============================================================
+# ScaledObject: AWS SQS トリガー（ゼロスケール対応）
+# ============================================================
+# 【動作説明】
+# SQS キューのメッセージ数に基づいて Pod 数を自動調整する。
+#
+# スケーリングの流れ:
+# 1. キューが空 (0 メッセージ) → KEDA が 0 台を維持（ゼロスケール）
+# 2. メッセージ到着 → KEDA Operator が 0 → 1 にアクティベート
+# 3. メッセージ増加 → KEDA が自動生成した HPA が 1 → N にスケールアウト
+#    計算式: ceil(N × メッセージ数 / queueLength)
+# 4. キュー空になり cooldownPeriod(120秒) 経過 → 0 台にスケールダウン
+#
+# 【コスト削減効果】
+# アイドル時は Pod が 0 台になり、EC2/Fargate のリソース課金が発生しない。
+# 開発・ステージング環境や夜間バッチ処理に特に有効。
+#
+# 【注意: コールドスタート遅延】
+# 0 → 1 のアクティベート時に Pod 起動時間(2〜15秒以上)の遅延が発生する。
+# レイテンシSLAが厳しい場合は minReplicaCount: 1 を設定すること。
+apiVersion: keda.sh/v1alpha1
+kind: ScaledObject
+metadata:
+  name: worker-sqs-scaler
+  namespace: demo
+  labels:
+    app: worker
+spec:
+  scaleTargetRef:
+    name: worker  # スケール対象の Deployment 名
+  minReplicaCount: 0      # 0 でゼロスケール有効（アイドル時 0 台）
+  maxReplicaCount: 20     # 最大 Pod 数
+  pollingInterval: 30     # SQS キュー深度の確認間隔（秒）
+  cooldownPeriod: 120     # キュー空になってから 0 台にするまでの待機秒数
+  # フォールバック: メトリクス取得が3回連続失敗したら2台を維持
+  fallback:
+    failureThreshold: 3
+    replicas: 2
+  triggers:
+  - type: aws-sqs-queue
+    authenticationRef:
+      name: keda-aws-irsa-auth  # 上記TriggerAuthenticationを参照
+    metadata:
+      # 【必須】SQS キューのフル URL（環境変数で渡す場合は queueURLFromEnv を使用）
+      queueURL: https://sqs.ap-northeast-1.amazonaws.com/123456789012/my-task-queue
+      # 1 Pod あたりの目標メッセージ数
+      # 例: メッセージ100件・queueLength=5 → 目標 20 Pod
+      queueLength: "5"
+      # ゼロスケール時のアクティベーション閾値（0 = 1 メッセージでも即アクティベート）
+      activationQueueLength: "0"
+      awsRegion: ap-northeast-1
+      # true: 処理中(in-flight)メッセージもカウントに含む（二重処理防止に有効）
+      scaleOnInFlight: "true"
+      # false: 遅延メッセージ(delayed)はカウントに含まない（デフォルト）
+      scaleOnDelayed: "false"
+
+---
+# ============================================================
+# ScaledObject: Apache Kafka トリガー
+# ============================================================
+# 【動作説明】
+# Kafka コンシューマーグループのラグ（処理待ちメッセージ数）に基づいてスケール。
+#
+# 【Kafka スケーリングの注意点】
+# スケールイベントのたびにコンシューマーグループのリバランシングが発生し、
+# 処理が一時停止する（stop-the-world）。
+# 対策: Kafka の協調スティッキーリバランス設定を有効化する。
+#   partition.assignment.strategy=CooperativeStickyAssignor
+#
+# 【パーティション数の制約】
+# Kafka は 1 パーティション = 1 コンシューマーの制約があるため、
+# maxReplicaCount はトピックのパーティション数を超えないように設定する。
+apiVersion: keda.sh/v1alpha1
+kind: ScaledObject
+metadata:
+  name: stream-processor-kafka-scaler
+  namespace: demo
+  labels:
+    app: stream-processor
+spec:
+  scaleTargetRef:
+    name: stream-processor
+  minReplicaCount: 0
+  maxReplicaCount: 10  # ← Kafka トピックのパーティション数以下に設定すること
+  pollingInterval: 30
+  cooldownPeriod: 300
+  fallback:
+    failureThreshold: 3
+    replicas: 1
+  triggers:
+  - type: kafka
+    metadata:
+      bootstrapServers: kafka-service.kafka.svc.cluster.local:9092
+      consumerGroup: stream-processor-group  # 監視対象のコンシューマーグループ
+      topic: events-topic                    # 監視対象トピック（省略時は全トピックのlag合計）
+      # 1 Pod あたりの目標ラグ数
+      # 例: ラグ=200, lagThreshold=50 → ceil(200/50) = 4 Pod が目標
+      lagThreshold: "50"
+      # ゼロからのアクティベーション閾値（1 メッセージ以上でアクティベート）
+      activationLagThreshold: "1"
+      offsetResetPolicy: latest
+
+---
+# ============================================================
+# ScaledObject: Prometheus メトリクス + Cron 複合トリガー
+# ============================================================
+# 【動作説明】
+# 2 つのトリガーを組み合わせたマルチトリガー構成:
+# 1. Prometheus: HTTP リクエストレートに基づくリアルタイムスケール
+# 2. Cron: 業務時間帯（平日9-18時 JST）は最低 3 台を保証
+#
+# 【マルチトリガーのルール】
+# 複数のトリガーが同時にアクティブな場合、最大の desiredReplicas が採用される。
+# 例: Prometheus が 5 台、Cron が 3 台を要求 → 5 台が採用される。
+apiVersion: keda.sh/v1alpha1
+kind: ScaledObject
+metadata:
+  name: api-server-multi-scaler
+  namespace: demo
+  labels:
+    app: api-server
+spec:
+  scaleTargetRef:
+    name: api-server
+  minReplicaCount: 1      # レイテンシSLA保護のため最低 1 台を維持
+  maxReplicaCount: 50
+  pollingInterval: 15     # リアルタイム性が必要なため短めに設定
+  cooldownPeriod: 300
+  triggers:
+  # --- トリガー1: Prometheus（リクエストレート） ---
+  # PromQL クエリが単一の数値を返すように記述する
+  - type: prometheus
+    metadata:
+      serverAddress: http://prometheus.monitoring.svc.cluster.local:9090
+      # 直近2分間の API リクエストレート合計
+      query: sum(rate(http_requests_total{service="api-server"}[2m]))
+      # 1 Pod あたりの目標リクエスト数/秒
+      threshold: "100"
+      # ゼロスケール保護（minReplicaCount=1 なので実質不要だが明示）
+      activationThreshold: "10"
+      # Prometheus が応答しない場合は無視して他のトリガーを使用
+      ignoreNullValues: "true"
+  # --- トリガー2: Cron（業務時間帯スケジュール） ---
+  # 業務時間帯は最低 3 台を保証（SLAと事前スケールの両立）
+  - type: cron
+    metadata:
+      timezone: Asia/Tokyo
+      start: "0 9 * * 1-5"   # 平日 9:00 開始
+      end: "0 18 * * 1-5"    # 平日 18:00 終了
+      desiredReplicas: "3"    # 業務時間中の最低保証台数
+
+---
+# ============================================================
+# Deployment: スケール対象サンプル
+# ============================================================
+# 【注意】
+# KEDA が CPU/メモリベースのスケーリングを行う場合、
+# resources.requests の設定が必須（未設定だと HPA が動作しない）。
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: worker
+  namespace: demo
+spec:
+  replicas: 1  # KEDA によって動的に変更される
+  selector:
+    matchLabels:
+      app: worker
+  template:
+    metadata:
+      labels:
+        app: worker
+    spec:
+      # IRSA を使用する場合、ServiceAccount に IAM ロールアノテーションを付与する
+      serviceAccountName: worker-sa
+      containers:
+      - name: worker
+        image: your-registry/worker:latest  # 実際のイメージに変更してください
+        resources:
+          requests:
+            cpu: "250m"
+            memory: "256Mi"
+          limits:
+            cpu: "1"
+            memory: "512Mi"
+        env:
+        - name: SQS_QUEUE_URL
+          valueFrom:
+            configMapKeyRef:
+              name: worker-config
+              key: sqs_queue_url
+        # graceful shutdown: スケールダウン時に処理中のタスクを完了させる
+        # 長時間バッチは ScaledJob の使用を検討する
+        terminationGracePeriodSeconds: 60
