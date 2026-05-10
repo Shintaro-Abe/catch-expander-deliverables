@@ -186,4 +186,4 @@ export CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1
 
 ---
 
-📝 [Notionで詳細を見る]()
+📝 [Notionで詳細を見る](https://www.notion.so/Claude-Code-VS-Code-35c47b55202e814483c0d3e8511f825a)
