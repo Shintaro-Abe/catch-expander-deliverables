@@ -456,4 +456,4 @@ PR 作成・更新
 
 ---
 
-📝 [Notionで詳細を見る]()
+📝 [Notionで詳細を見る](https://www.notion.so/Claude-Code-GitHub-Actions-Playwright-35d47b55202e81c6964ae6d33900b9b8)
