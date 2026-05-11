@@ -1,0 +1,223 @@
+# PoC品質: 本番環境での利用前にセキュリティレビューと動作検証を行ってください
+# Claude Code + GitHub Actions + Playwright 統合ワークフロー
+#
+# 概要:
+#   1. PRが作成・更新されたとき、Playwrightのテストを並列実行（シャーディング）
+#   2. テスト失敗時に Claude Code Action が自動で原因分析とコメントを投稿
+#   3. @claude メンションでインタラクティブなコードレビューも可能
+#
+# 必要なシークレット（GitHub Settings > Secrets and variables > Actions）:
+#   - ANTHROPIC_API_KEY : Anthropic API キー（絶対にコードに直接書かない）
+#
+# 必要な権限（ワークフローファイルで宣言）:
+#   - contents: read        → コードの読み取り
+#   - pull-requests: write  → PRへのコメント投稿
+#   - issues: write         → Issue操作
+
+name: Claude Code + Playwright CI
+
+on:
+  # PRの作成・更新時にトリガー
+  pull_request:
+    types: [opened, synchronize]
+    paths:
+      - 'src/**'
+      - 'tests/**'
+      - 'playwright.config.ts'
+      - '!docs/**'   # ドキュメント変更ではCIを実行しない（コスト削減）
+
+  # Issue/PRへの @claude メンションでインタラクティブモードが起動
+  issue_comment:
+    types: [created]
+  pull_request_review_comment:
+    types: [created]
+
+# 同一PRへの複数Claudeジョブ競合を防止（コスト・リソース管理）
+# cancel-in-progress: 古い実行を自動キャンセルし無駄なcompute時間を削減
+concurrency:
+  group: ${{ github.workflow }}-${{ github.head_ref || github.ref }}
+  cancel-in-progress: true
+
+# ワークフロー全体のデフォルト権限（最小権限の原則）
+permissions:
+  contents: read
+  pull-requests: write
+  issues: write
+
+jobs:
+  # =========================================================
+  # Job 1: Playwright テストをシャーディングで並列実行
+  #   シャーディング = テストスイートを複数のジョブに分割して同時実行する仕組み
+  #   例: 100テストを4分割すると、各ジョブは25テストずつ担当
+  # =========================================================
+  playwright-tests:
+    name: Playwright Tests (Shard ${{ matrix.shardIndex }}/${{ matrix.shardTotal }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 30    # ランアウェイジョブ（暴走ジョブ）を防止
+    if: github.event_name == 'pull_request'
+
+    strategy:
+      fail-fast: false     # 1つのシャードが失敗しても他を継続（全体の状況を把握するため）
+      matrix:
+        shardIndex: [1, 2, 3, 4]   # 4分割で並列実行
+        shardTotal: [4]
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 'lts/*'
+          cache: 'npm'     # node_modules をキャッシュしてインストール時間を短縮
+
+      - name: Install dependencies
+        run: npm ci
+
+      # Playwright ブラウザバイナリのキャッシュ
+      # 注意: 公式は「キャッシュは推奨しない（復元時間 ≈ ダウンロード時間）」と明記しているが、
+      # ブラウザ数が多い場合は効果的なため採用。不要なら削除して `npx playwright install --with-deps` のみに。
+      - name: Cache Playwright browsers
+        id: playwright-cache
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/ms-playwright
+          # パッケージバージョンが変わったら自動でキャッシュ更新
+          key: ${{ runner.os }}-playwright-${{ hashFiles('package-lock.json') }}
+
+      - name: Install Playwright browsers (キャッシュミス時のみ)
+        if: steps.playwright-cache.outputs.cache-hit != 'true'
+        run: npx playwright install --with-deps
+
+      - name: Install system dependencies (キャッシュヒット時のみ)
+        if: steps.playwright-cache.outputs.cache-hit == 'true'
+        run: npx playwright install-deps
+
+      - name: Run Playwright tests (Shard ${{ matrix.shardIndex }}/${{ matrix.shardTotal }})
+        run: npx playwright test --shard=${{ matrix.shardIndex }}/${{ matrix.shardTotal }}
+
+      # blobレポート = 後でシャード間で統合するための中間形式レポート
+      # if: ${{ !cancelled() }} → テスト失敗時でもレポートをアップロード（原因調査のため）
+      - name: Upload blob report
+        if: ${{ !cancelled() }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: blob-report-${{ matrix.shardIndex }}
+          path: blob-report
+          retention-days: 1    # 統合後は不要なので短い保持期間
+
+      # 失敗時のスクリーンショット・トレース・動画を保存
+      - name: Upload test artifacts on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: test-results-shard-${{ matrix.shardIndex }}
+          path: |
+            test-results/
+          retention-days: 7
+
+  # =========================================================
+  # Job 2: 各シャードのblobレポートを1つのHTMLレポートに統合
+  # =========================================================
+  merge-reports:
+    name: Merge Playwright Reports
+    if: ${{ !cancelled() && github.event_name == 'pull_request' }}
+    needs: [playwright-tests]
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 'lts/*'
+          cache: 'npm'
+      - run: npm ci
+
+      - name: Download all blob reports
+        uses: actions/download-artifact@v4
+        with:
+          path: all-blob-reports
+          pattern: blob-report-*
+          merge-multiple: true
+
+      - name: Merge into HTML Report
+        run: npx playwright merge-reports --reporter html ./all-blob-reports
+
+      - name: Upload merged HTML report
+        uses: actions/upload-artifact@v4
+        with:
+          name: html-report--attempt-${{ github.run_attempt }}
+          path: playwright-report
+          retention-days: 14
+
+  # =========================================================
+  # Job 3: テスト失敗時に Claude が自動で原因分析
+  #   needs: [playwright-tests] で Job1 完了後に実行
+  #   if: failure() で Job1 が失敗した場合のみ実行
+  # =========================================================
+  claude-failure-analysis:
+    name: Claude Failure Analysis
+    needs: [playwright-tests]
+    if: failure() && github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      pull-requests: write
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0    # 完全な git 履歴を取得（差分分析のため）
+
+      # 失敗したシャードのアーティファクトをダウンロード
+      - name: Download failed test results
+        uses: actions/download-artifact@v4
+        with:
+          pattern: test-results-shard-*
+          path: failed-test-results
+          merge-multiple: true
+
+      # Claude Code Action でテスト失敗を自動分析
+      # automation mode: prompt パラメータ指定時は自動実行モード
+      - name: Analyze failures with Claude
+        uses: anthropics/claude-code-action@v1
+        with:
+          anthropic_api_key: ${{ secrets.ANTHROPIC_API_KEY }}
+          prompt: |
+            Playwrightのテストが失敗しました。以下を分析してください：
+
+            1. `failed-test-results/` ディレクトリ内のスクリーンショットとトレースを確認
+            2. 変更されたファイル (`git diff origin/${{ github.base_ref }}...HEAD`) を確認
+            3. 失敗の根本原因を特定（テストコードのバグ / アプリのバグ / セレクタの変化 を区別）
+            4. 修正案を日本語で簡潔にPRコメントとして投稿
+
+            注意: 「フレーキーテスト（非決定的な失敗）」と「コードバグによる失敗」を区別し、
+            前者の場合はその旨を明記してください。
+          claude_args: "--max-turns 5 --model claude-sonnet-4-6"
+
+  # =========================================================
+  # Job 4: @claude メンションへのインタラクティブ応答
+  #   PRコメントで `@claude レビューして` などのメンションに反応
+  # =========================================================
+  claude-interactive:
+    name: Claude Interactive Mode
+    if: |
+      github.event_name == 'issue_comment' ||
+      github.event_name == 'pull_request_review_comment'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      pull-requests: write
+      issues: write
+
+    steps:
+      - uses: actions/checkout@v4
+
+      # interactive mode: prompt を省略すると @claude メンションに応答するモードになる
+      - name: Respond to @claude mentions
+        uses: anthropics/claude-code-action@v1
+        with:
+          anthropic_api_key: ${{ secrets.ANTHROPIC_API_KEY }}
+          trigger_phrase: "@claude"    # このフレーズでトリガー（カスタマイズ可能）
+          claude_args: "--max-turns 10 --model claude-sonnet-4-6"
