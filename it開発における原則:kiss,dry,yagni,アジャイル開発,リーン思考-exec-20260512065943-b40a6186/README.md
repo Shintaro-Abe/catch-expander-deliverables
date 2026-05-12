@@ -96,4 +96,4 @@ python refactoring_journey.py
 
 ---
 
-📝 [Notionで詳細を見る]()
+📝 [Notionで詳細を見る](https://www.notion.so/IT-KISS-DRY-YAGNI-35e47b55202e8182b8b6f8edcad1902c)
