@@ -234,4 +234,4 @@ CloudHSM クラスター（シングルテナント専有 HSM）
 
 ---
 
-📝 [Notionで詳細を見る]()
+📝 [Notionで詳細を見る](https://www.notion.so/HSM-35e47b55202e815ea8a0f103aab9d8f1)
