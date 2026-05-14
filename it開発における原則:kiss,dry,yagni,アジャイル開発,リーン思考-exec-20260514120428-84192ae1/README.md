@@ -91,4 +91,4 @@ python code_review_checklist.py
 
 ---
 
-📝 [Notionで詳細を見る]()
+📝 [Notionで詳細を見る](https://www.notion.so/IT-KISS-DRY-YAGNI-36047b55202e8197ba39c2acf5bdbd8b)
