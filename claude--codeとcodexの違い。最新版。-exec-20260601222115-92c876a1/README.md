@@ -86,4 +86,4 @@ python openai_codex_client.py --task "FizzBuzzをPythonで実装してくださ�
 
 ---
 
-📝 [Notionで詳細を見る]()
+📝 [Notionで詳細を見る](https://www.notion.so/Claude-Code-Codex-37247b55202e8144882eda907ebe22b8)
