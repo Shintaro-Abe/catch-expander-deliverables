@@ -183,4 +183,4 @@ IDE統合        → Cursor / Claude Code — 既存コードベースの編集
 
 ---
 
-📝 [Notionで詳細を見る]()
+📝 [Notionで詳細を見る](https://app.notion.com/p/AI-DLC-Bolt-37c47b55202e8194b434eb7ac1ac302e)
