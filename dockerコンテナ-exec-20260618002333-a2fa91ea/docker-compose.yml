@@ -1,0 +1,118 @@
+# PoC品質: このdocker-compose.ymlは学習・ローカル開発目的のスケルトンです。
+# 本番環境ではECS/Fargate等のオーケストレーション基盤を使用してください。
+#
+# 構成:
+#   - llm-service : 推論APIサーバー（Dockerfileからビルド）
+#   - mlflow      : 実験管理トラッキングサーバー
+#   - postgres    : MLflowのバックエンドストア
+#
+# 起動: docker compose up -d
+# 停止: docker compose down
+# 全削除（ボリュームも): docker compose down -v
+
+services:
+
+  # ===== LLM推論サービス =====
+  llm-service:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      target: runtime          # マルチステージビルドの実行ステージを指定
+    image: llm-service:local
+    container_name: llm-service
+    ports:
+      - "8000:8000"
+    environment:
+      # シークレットは環境変数で渡す（.envファイル経由 or CI/CDのシークレット管理）
+      # 実際の値はこのファイルにハードコードしない
+      - LOG_LEVEL=${LOG_LEVEL:-INFO}
+      - MLFLOW_TRACKING_URI=http://mlflow:5000
+      - HF_HOME=/app/.cache/huggingface
+    volumes:
+      # モデルキャッシュを永続化してコールドスタートを回避
+      - hf-cache:/app/.cache/huggingface
+    networks:
+      - frontend   # 外部からアクセス可能
+      - backend    # MLflow等の内部サービスと通信
+    depends_on:
+      mlflow:
+        condition: service_healthy
+    restart: unless-stopped
+    # セキュリティオプション: 権限昇格を防止
+    security_opt:
+      - no-new-privileges:true
+    # 読み取り専用ファイルシステム（tmpfsで一時領域を確保）
+    read_only: true
+    tmpfs:
+      - /tmp:size=256m
+
+  # ===== MLflow トラッキングサーバー =====
+  mlflow:
+    image: ghcr.io/mlflow/mlflow:v2.14.0    # latestタグは避け、バージョンを固定
+    container_name: mlflow
+    command: >
+      mlflow server
+      --backend-store-uri postgresql://mlflow:${MLFLOW_DB_PASSWORD:-changeme}@postgres:5432/mlflow
+      --default-artifact-root /mlflow/artifacts
+      --host 0.0.0.0
+      --port 5000
+    ports:
+      - "5000:5000"   # ローカル開発用。本番では内部ネットワークのみ公開
+    environment:
+      - MLFLOW_TRACKING_URI=http://0.0.0.0:5000
+    volumes:
+      - mlflow-artifacts:/mlflow/artifacts
+    networks:
+      - backend      # 外部に公開しない内部ネットワークのみ
+    depends_on:
+      postgres:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:5000/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 30s
+    restart: unless-stopped
+
+  # ===== PostgreSQL (MLflowバックエンドストア) =====
+  postgres:
+    image: postgres:16-alpine    # alpine版で軽量化
+    container_name: postgres
+    environment:
+      - POSTGRES_DB=mlflow
+      - POSTGRES_USER=mlflow
+      # 本番では Secrets Manager / SSM Parameter Store から取得すること
+      - POSTGRES_PASSWORD=${MLFLOW_DB_PASSWORD:-changeme}
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+    networks:
+      - backend
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U mlflow -d mlflow"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+    restart: unless-stopped
+    # DBはフロントエンドネットワークに接続しない（外部露出を防ぐ）
+
+# ===== ネットワーク定義 =====
+# frontend: 外部（ブラウザ・APIクライアント）からアクセス可能なサービス
+# backend:  内部サービス間通信専用（DBやMLflowを外部から隔離）
+networks:
+  frontend:
+    driver: bridge
+  backend:
+    driver: bridge
+    internal: true    # ホストからのアクセスを遮断
+
+# ===== ボリューム定義 =====
+# named volumeはコンテナ削除後もデータが保持される
+volumes:
+  postgres-data:
+    driver: local
+  mlflow-artifacts:
+    driver: local
+  hf-cache:
+    driver: local
