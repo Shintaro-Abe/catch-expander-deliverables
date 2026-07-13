@@ -282,4 +282,4 @@ Spring Bootの `@SpringBootApplication` がトリガーとなり、以下が自�
 
 ---
 
-📝 [Notionで詳細を見る]()
+📝 [Notionで詳細を見る](https://app.notion.com/p/spring-boot-39c47b55202e8106b2d0dba0dd2fc164)
