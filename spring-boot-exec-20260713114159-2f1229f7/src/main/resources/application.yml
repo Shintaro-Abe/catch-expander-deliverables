@@ -1,0 +1,152 @@
+# PoC 品質 — 実運用前にシークレット管理・セキュリティ設定を追加すること
+# ハードコードされた認証情報は含まない。環境変数で注入すること。
+
+# ─── Spring Boot 基本設定 ────────────────────────────────────────────────────
+
+spring:
+  application:
+    name: springboot-demo
+
+  # ─── データソース（JPA使用時）──────────────────────────────────────────────
+  datasource:
+    # 環境変数から注入（例: DB_URL=jdbc:postgresql://localhost:5432/mydb）
+    url: ${DB_URL:jdbc:h2:mem:testdb}
+    username: ${DB_USERNAME:sa}
+    password: ${DB_PASSWORD:}
+    driver-class-name: ${DB_DRIVER:org.h2.Driver}
+    hikari:
+      maximum-pool-size: 10
+      minimum-idle: 2
+      connection-timeout: 30000
+
+  jpa:
+    hibernate:
+      ddl-auto: validate  # 本番: validate / 開発: create-drop
+    show-sql: false       # 本番: false / デバッグ時のみ true
+    open-in-view: false   # N+1問題防止のため無効化推奨
+
+  # ─── Spring AI 設定 ───────────────────────────────────────────────────────
+  ai:
+    # --- OpenAI ---
+    openai:
+      api-key: ${OPENAI_API_KEY:}
+      chat:
+        options:
+          model: gpt-4o
+          temperature: 0.7
+          max-tokens: 2048
+
+    # --- Anthropic Claude ---
+    anthropic:
+      api-key: ${ANTHROPIC_API_KEY:}
+      chat:
+        options:
+          # Spring AI 1.1 対応モデル
+          model: claude-sonnet-4-5
+          max-tokens: 4096
+          # Prompt Caching（最大90%コスト削減）
+          # 有効にするには anthropic-beta: prompt-caching-2024-07-31 ヘッダーが必要
+          temperature: 0.5
+
+    # --- VectorStore: PgVector（PostgreSQL拡張）---
+    vectorstore:
+      pgvector:
+        index-type: hnsw
+        distance-type: cosine_distance
+        dimensions: 1536  # text-embedding-3-small の次元数
+        initialize-schema: true  # 初回起動時にスキーマ作成
+
+# ─── サーバー設定 ─────────────────────────────────────────────────────────────
+
+server:
+  port: ${PORT:8080}
+  servlet:
+    context-path: /
+
+  # Graceful Shutdown（Kubernetes の SIGTERM に対応）
+  shutdown: graceful
+
+spring.lifecycle:
+  timeout-per-shutdown-phase: 30s
+
+# ─── Actuator（ヘルスチェック・メトリクス）─────────────────────────────────────
+
+management:
+  server:
+    port: 8081  # 管理エンドポイントを別ポートに分離
+
+  endpoints:
+    web:
+      exposure:
+        # 本番では必要最小限のエンドポイントのみ公開
+        include: health, info, metrics, prometheus
+
+  endpoint:
+    health:
+      show-details: when_authorized  # 本番: 認可済みユーザーのみ詳細表示
+      probes:
+        enabled: true  # Kubernetes プローブ用（/health/liveness, /health/readiness）
+
+  # Micrometer → CloudWatch メトリクス送信
+  metrics:
+    export:
+      cloudwatch:
+        namespace: ${CLOUDWATCH_NAMESPACE:SpringBootDemo}
+        batch-size: 20  # CloudWatch API上限（20メトリクス/リクエスト）
+        enabled: ${CLOUDWATCH_ENABLED:false}
+    tags:
+      application: ${spring.application.name}
+      environment: ${APP_ENV:local}
+
+  # OpenTelemetry（Langfuse / Datadog / Jaeger 等への送信）
+  tracing:
+    sampling:
+      probability: ${TRACING_SAMPLE_RATE:1.0}  # 本番: 0.1 程度に調整
+  otlp:
+    tracing:
+      endpoint: ${OTEL_EXPORTER_OTLP_ENDPOINT:http://localhost:4317}
+
+# ─── ロギング ────────────────────────────────────────────────────────────────
+
+logging:
+  level:
+    root: INFO
+    com.example.springboot: DEBUG
+    # Spring AI のリクエスト/レスポンスをデバッグ出力（本番では INFO 以上を推奨）
+    org.springframework.ai: INFO
+  pattern:
+    console: "%d{yyyy-MM-dd HH:mm:ss} [%thread] %-5level %logger{36} - %msg%n"
+
+# ─── プロファイル別設定 ───────────────────────────────────────────────────────
+# 起動時に spring.profiles.active=prod 等で切り替え
+# application-dev.yml / application-prod.yml で上書き設定を記述
+
+---
+spring.config.activate.on-profile: dev
+
+logging:
+  level:
+    com.example.springboot: DEBUG
+    org.springframework.ai: DEBUG
+
+management:
+  endpoint:
+    health:
+      show-details: always
+
+---
+spring.config.activate.on-profile: prod
+
+logging:
+  level:
+    root: WARN
+    com.example.springboot: INFO
+
+management:
+  endpoint:
+    health:
+      show-details: when_authorized
+
+server:
+  ssl:
+    enabled: ${SSL_ENABLED:false}
