@@ -231,4 +231,4 @@ print(response["output"]["text"])
 
 ---
 
-📝 [Notionで詳細を見る]()
+📝 [Notionで詳細を見る](https://app.notion.com/p/AWS2-0-39f47b55202e8147bd81fab7ebedf24a)
